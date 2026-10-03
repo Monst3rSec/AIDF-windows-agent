@@ -5,9 +5,9 @@ in [ADLC.md](ADLC.md). Dates are UTC.
 
 ## Current state (2026-10-03)
 
-Version 0.1.0. The collector is written and builds. It has **not yet run on a real Windows
+Version 0.2.0. The collector is written and builds. It has **not yet run on a real Windows
 host**: Windows-only code is at V1 (compiles and links for x64, x86, arm64; binaries are
-in `dist/`), portable logic is at V2 (15 unit tests pass on macOS). The next step is T-201.
+in `dist/`), portable logic is at V2 (17 unit tests pass on macOS). The next step is T-201.
 
 ## Phase 1 - Discover
 
@@ -45,6 +45,7 @@ in `dist/`), portable logic is at V2 (15 unit tests pass on macOS). The next ste
 | T-113 | `build.sh`: host + Windows x64/x86/arm64, test, check, setup, checksums | Done | Full run on macOS produced all three `.exe` (cargo-xwin) |
 | T-116 | Bare `aidf` / double-click: elevate via UAC, collect, store next to the exe, pause | Done | V2 (default run and output location on macOS), V1 (UAC relaunch) |
 | T-117 | Default output directory is the folder of the executable | Done | V2 |
+| T-118 | Overlapped collection: one probe queue on `--jobs` threads, parallel manifest hashing, faster zip level | Done | V2 (engine, ordering, integrity), V1 (real speed-up on Windows unmeasured) |
 | T-114 | CI: Windows build of all flavours, on-runner collect + verify smoke test | Written | V0 - never executed |
 | T-115 | Docs: README, PROJECT, ADLC, TRACKER, CLAUDE | Done | - |
 
@@ -58,7 +59,8 @@ in `dist/`), portable logic is at V2 (15 unit tests pass on macOS). The next ste
 | T-204 | Confirm `HKCU` expansion and `*` registry wildcards on a multi-user host | Open | Each loaded hive appears under `HKU\<SID>` |
 | T-205 | Run as a non-admin: degrade cleanly | Open | Run completes; failures are recorded, none fatal |
 | T-209 | Double-click on Windows: UAC prompt, elevated window collects and pauses; declined UAC still collects | Open | Both paths behave as described |
-| T-206 | Measure runtime and output size on a typical workstation and a server | Open | Recorded here |
+| T-206 | Measure runtime and output size on a typical workstation and a server, `--jobs 1` vs default | Open | Recorded here |
+| T-210 | Check overlapped probes on Windows for contention (WMI, event log, VSS) | Open | No probe fails under default `--jobs` that passes under `--jobs 1` |
 | T-208 | `--live` on a test VM: RAM dump and packet capture | Open | Dump and capture produced and hashed |
 
 ## Backlog
@@ -88,6 +90,7 @@ autoruns correlation summary, offline analyzer.
 | 2026-10-03 | Remove IOC; focus on evidence collection; collector program only | Owner |
 | 2026-10-03 | Bare run / double-click collects by default; evidence is stored next to the exe | Owner |
 | 2026-10-03 | Cross-compile with cargo-xwin (zig and mingw did not fit: low disk, no arm64) | Agent |
+| 2026-10-03 | Collection must run in parallel, modules overlapping, for speed | Owner |
 | 2026-10-03 | Keep `aidf verify` (integrity of the collected set, not analysis) | Agent - owner to confirm |
 | 2026-10-03 | No per-file hash sidecars: one manifest, itself hashed | Agent |
 | 2026-10-03 | Never download tools on the target; never collect secrets | Agent |

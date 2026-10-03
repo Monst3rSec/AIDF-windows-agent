@@ -262,6 +262,12 @@ fn cmd(ctx: &Ctx, collector: &str, exe: &str, args: Strs) -> Result<Value, Strin
             a
         })
         .collect();
+    // Probes overlap, but Windows allows only one shadow-copy creation at a time.
+    static VSS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_snapshot_at_a_time = args
+        .iter()
+        .any(|a| a == "/vss")
+        .then(|| VSS.lock().unwrap_or_else(|e| e.into_inner()));
     let (code, out) = exec(exe, &args, ctx.timeout)?;
     let lines: Vec<&str> = out.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
     Ok(json!({ "Command": format!("{exe} {}", args.join(" ")), "ExitCode": code, "Output": lines }))

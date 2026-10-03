@@ -39,7 +39,10 @@ cargo run -- collect --out /tmp/ir --phase Named_Pipes   # pipeline smoke run of
 
 ## Rules that are easy to break
 
-- **Catalog order is collection order**, most volatile first. Tests assert the anchors.
+- **Catalog order is start order**, most volatile first. Tests assert the anchors.
+- **Probes run concurrently.** A probe must not depend on another probe having run, must
+  write only under its own `raw/<collector>/<probe>` path, and must not hold global state.
+  Anything that cannot overlap (state-changing) belongs in a `live(...)` collector.
 - **`Ps` bodies: no double quotes, no `#`.** They travel as one command-line argument and
   are collapsed to one line. Separate statements with `;`. A test enforces this.
 - **`Ps` output must be JSON-safe:** wrap dates in `T ...` (UTC ISO-8601) and cast enums

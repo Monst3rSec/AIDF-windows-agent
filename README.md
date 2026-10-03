@@ -64,9 +64,18 @@ aidf list                  Show the collection plan
 | `--tools <dir>` | Where `winpmem*.exe` lives | `<exe dir>\Tools` |
 | `--max-mb <n>` | Per-file ceiling for raw copies and packaging (`DFIR_PACKAGE_MAXMB`) | 1024 |
 | `--timeout <sec>` | Per-command timeout | 300 |
+| `--jobs <n>` | Probes run at once (`AIDF_JOBS`); `1` = strictly sequential | CPU cores, 4 to 8 |
 
 Live-capture tuning: `DFIR_WINPMEM_SHA256` (pin the WinPmem binary), `AIDF_PCAP_SECS`
 (capture length, default 60), `AIDF_PCAP_MAXMB` (default 512).
+
+## Speed
+
+Collection is overlapped: all 221 probes go into one queue in order of volatility and run
+on several threads at once, so a slow event-log query no longer holds up the registry or
+file-system work. Each collector's file is written as soon as its last probe returns.
+Manifest hashing is parallel too. `RAM_Dump` and `Packet_Capture` never overlap with
+anything. Use `--jobs 1` for a strictly sequential run on a fragile host.
 
 ## Forensic safety
 

@@ -61,6 +61,16 @@ a few lines that matter. Here those few lines are data. A collector is a row in
 | `Cmd` | Run a built-in Windows command, keep its output | built-in exe |
 | `Ps` | PowerShell/CIM query returning JSON | `powershell.exe` |
 
+### Execution model
+
+`collect.rs` flattens the plan into one queue of (collector, probe) tasks in catalog order
+and runs it on `--jobs` threads. Order of *starting* therefore still follows volatility;
+order of *finishing* does not, so each collector's `Started`/`Finished` times overlap with
+its neighbours. Results are reassembled in catalog order, so evidence files are laid out
+the same whatever the timing. Live collectors run alone: `RAM_Dump` before the queue,
+`Packet_Capture` after it. Shadow-copy commands (`esentutl /vss`) are serialised because
+Windows allows one snapshot creation at a time.
+
 Path templates accept `%ENV%`, `{users}` (every profile) and `*` in any segment. Registry
 templates accept `*` segments, and `HKCU\...` is read from every loaded user hive, not
 just the hive of whoever ran the tool.
@@ -113,6 +123,7 @@ own hash is in `Evidence_Manifest.json.sha256`. `aidf verify` reports `MISMATCH`
 | Flat output directory shared by runs | one directory per run | runs never mix |
 | Output to `C:\IR_Collection` | output next to the exe | run from a USB stick and the evidence lands on the stick, not the suspect disk |
 | Launcher self-elevates | bare `aidf` (double-click) self-elevates via UAC, collects, pauses | same one-click use, no unpacking |
+| Scripts run strictly one after another | probes overlap on 4 to 8 threads, started in volatility order | much shorter wall-clock time; `--jobs 1` restores sequential |
 | "Suspicious" flags inside collectors | none | collection only (owner decision) |
 | Report, timeline, IOC, VirusTotal | none | collection only (owner decision) |
 

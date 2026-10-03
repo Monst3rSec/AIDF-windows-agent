@@ -27,6 +27,8 @@ pub struct Ctx {
     pub timeout: Duration,
     /// Per-file ceiling for raw copies and for embedding in the sealed package.
     pub max_copy_mb: u64,
+    /// How many probes may run at once.
+    pub jobs: usize,
     pub started: u64,
 }
 

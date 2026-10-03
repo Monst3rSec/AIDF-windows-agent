@@ -7,6 +7,8 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 pub const MANIFEST: &str = "Evidence_Manifest.json";
 pub const MANIFEST_HASH: &str = "Evidence_Manifest.json.sha256";
@@ -44,25 +46,53 @@ fn custody(ctx: &Ctx) -> Value {
     })
 }
 
-/// Run one collector and write `<Name>.json`. Returns its row for the manifest.
-fn run_collector(ctx: &Ctx, c: &Collector) -> Value {
-    let started = util::now();
-    let (mut data, mut errors, mut skipped) = (Map::new(), Vec::new(), Vec::new());
-    for p in c.probes {
-        if p.is_raw() && !ctx.raw {
-            skipped.push(json!({ "Probe": p.name(), "Reason": "raw copies disabled (--no-raw)" }));
-            continue;
+/// Run `f` over `items` on up to `jobs` threads; results come back in input order.
+/// Items are claimed in order, so earlier items always start first.
+fn par_map<T: Sync, R: Send>(items: &[T], jobs: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let out: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..jobs.clamp(1, items.len().max(1)) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                *lock(&out[i]) = Some(f(item));
+            });
         }
-        // A panicking probe must not take the rest of the collection down with it.
-        let res = catch_unwind(AssertUnwindSafe(|| probe::run(p, ctx, c.name))).unwrap_or_else(|_| Err("probe panicked".into()));
-        match res {
-            Ok(v) => {
+    });
+    out.into_iter()
+        .filter_map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+        .collect()
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+enum Outcome {
+    Skipped,
+    Done(Result<Value, String>),
+}
+
+/// A collector whose probes are running, possibly on several threads at once.
+struct Slot {
+    started: u64,
+    left: usize,
+    outcomes: Vec<Option<Outcome>>,
+}
+
+/// Assemble a finished collector's probe outcomes (in catalog order, whatever order they
+/// finished in), write `<Name>.json`, and return its row for the manifest.
+fn finish_collector(ctx: &Ctx, c: &Collector, started: u64, outcomes: Vec<Option<Outcome>>) -> Value {
+    let (mut data, mut errors, mut skipped) = (Map::new(), Vec::new(), Vec::new());
+    for (p, outcome) in c.probes.iter().zip(outcomes) {
+        match outcome {
+            Some(Outcome::Done(Ok(v))) => {
                 data.insert(p.name().into(), v);
             }
-            Err(e) => {
-                ctx.log("WARN", &format!("{}.{}: {e}", c.name, p.name()));
-                errors.push(json!({ "Probe": p.name(), "Kind": p.kind(), "Error": e }));
-            }
+            Some(Outcome::Done(Err(e))) => errors.push(json!({ "Probe": p.name(), "Kind": p.kind(), "Error": e })),
+            Some(Outcome::Skipped) => skipped.push(json!({ "Probe": p.name(), "Reason": "raw copies disabled (--no-raw)" })),
+            None => errors.push(json!({ "Probe": p.name(), "Kind": p.kind(), "Error": "probe did not run" })),
         }
     }
     let status = match (data.len(), errors.len()) {
@@ -87,14 +117,73 @@ fn run_collector(ctx: &Ctx, c: &Collector) -> Value {
         Ok(()) => status.to_string(),
         Err(e) => format!("Failed (write: {e})"),
     };
+    let secs = util::now() - started;
+    let level = if status == "Success" { "OK" } else { "WARN" };
+    ctx.log(level, &format!("{}: {status} in {secs}s", c.name));
     json!({
         "Collector": c.name,
         "Phase": c.phase,
         "Status": status,
-        "DurationSec": util::now() - started,
+        "DurationSec": secs,
         "Probes": c.probes.len(),
         "Errors": errors.len(),
     })
+}
+
+/// Run a set of collectors with their probes overlapping on `ctx.jobs` threads.
+/// Every probe of every collector goes into one queue in catalog order, so the most
+/// volatile evidence is still started first; a collector's file is written the moment
+/// its last probe returns. Returns one manifest row per collector, in input order.
+fn run_set(ctx: &Ctx, set: &[&Collector]) -> Vec<Value> {
+    let tasks: Vec<(usize, usize)> = set
+        .iter()
+        .enumerate()
+        .flat_map(|(ci, c)| (0..c.probes.len()).map(move |pi| (ci, pi)))
+        .collect();
+    let slots: Vec<Mutex<Slot>> = set
+        .iter()
+        .map(|c| {
+            Mutex::new(Slot {
+                started: 0,
+                left: c.probes.len(),
+                outcomes: c.probes.iter().map(|_| None).collect(),
+            })
+        })
+        .collect();
+    let rows: Vec<Mutex<Option<Value>>> = set.iter().map(|_| Mutex::new(None)).collect();
+
+    par_map(&tasks, ctx.jobs, |&(ci, pi)| {
+        let (c, p) = (set[ci], &set[ci].probes[pi]);
+        {
+            let mut slot = lock(&slots[ci]);
+            if slot.started == 0 {
+                slot.started = util::now();
+                ctx.log("INFO", &format!("{} ({}) started", c.name, c.phase));
+            }
+        }
+        let outcome = if p.is_raw() && !ctx.raw {
+            Outcome::Skipped
+        } else {
+            // A panicking probe must not take the rest of the collection down with it.
+            let res = catch_unwind(AssertUnwindSafe(|| probe::run(p, ctx, c.name))).unwrap_or_else(|_| Err("probe panicked".into()));
+            if let Err(e) = &res {
+                ctx.log("WARN", &format!("{}.{}: {e}", c.name, p.name()));
+            }
+            Outcome::Done(res)
+        };
+        let finished = {
+            let mut slot = lock(&slots[ci]);
+            slot.outcomes[pi] = Some(outcome);
+            slot.left -= 1;
+            (slot.left == 0).then(|| (slot.started, std::mem::take(&mut slot.outcomes)))
+        };
+        if let Some((started, outcomes)) = finished {
+            *lock(&rows[ci]) = Some(finish_collector(ctx, c, started, outcomes));
+        }
+    });
+    rows.into_iter()
+        .filter_map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+        .collect()
 }
 
 /// Record the collector's own footprint so its processes and files can be told apart
@@ -146,20 +235,16 @@ fn evidence_files(root: &Path, exclude: &[&str]) -> Vec<(String, PathBuf, u64)> 
 
 /// Hash every file in the run directory into the manifest, then hash the manifest itself.
 fn manifest(ctx: &Ctx, results: &[Value], ntp: Value) -> io::Result<(usize, u64)> {
-    let mut total = 0;
-    let files: Vec<Value> = evidence_files(&ctx.out, &[MANIFEST, MANIFEST_HASH, LOG_NAME])
-        .into_iter()
-        .map(|(rel, path, size)| {
-            total += size;
-            let meta = fs::metadata(&path).ok();
-            json!({
-                "RelativePath": rel,
-                "SizeBytes": size,
-                "SHA256": util::sha256_file(&path).ok(),
-                "Modified": meta.and_then(|m| util::time_iso(m.modified())),
-            })
+    let listed = evidence_files(&ctx.out, &[MANIFEST, MANIFEST_HASH, LOG_NAME]);
+    let total: u64 = listed.iter().map(|(_, _, size)| size).sum();
+    let files = par_map(&listed, ctx.jobs, |(rel, path, size)| {
+        json!({
+            "RelativePath": rel,
+            "SizeBytes": size,
+            "SHA256": util::sha256_file(path).ok(),
+            "Modified": fs::metadata(path).ok().and_then(|m| util::time_iso(m.modified())),
         })
-        .collect();
+    });
     let count = |s: &str| {
         results
             .iter()
@@ -182,6 +267,7 @@ fn manifest(ctx: &Ctx, results: &[Value], ntp: Value) -> io::Result<(usize, u64)
             "LiveResponse": ctx.live,
             "RawArtifacts": ctx.raw,
             "LookbackDays": ctx.days,
+            "ParallelJobs": ctx.jobs,
         },
         "ExecutionSummary": {
             "Collectors": results.len(),
@@ -222,6 +308,7 @@ fn package(ctx: &Ctx) -> io::Result<PathBuf> {
         }
         let opts = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(Some(1))
             .large_file(size >= u32::MAX as u64);
         let Ok(mut src) = File::open(&file) else { continue };
         zip.start_file(rel, opts).map_err(io::Error::other)?;
@@ -266,24 +353,25 @@ pub fn collect(ctx: &Ctx, plan: &[&Collector], seal: bool) -> io::Result<()> {
     let ntp = time_source();
     footprint(ctx);
 
+    // Live collectors change system state, so they never overlap with anything: those at
+    // the head of the plan (RAM) run alone first, the rest (packet capture) alone at the end.
+    // Everything in between is read-only and runs overlapped.
+    let lead = plan.iter().take_while(|c| c.live).count();
+    let (before, rest) = plan.split_at(lead);
+    let (overlapped, after): (Vec<&Collector>, Vec<&Collector>) = rest.iter().partition(|c| !c.live);
+    ctx.log("INFO", &format!("{} collectors, {} parallel jobs", plan.len(), ctx.jobs));
     let mut results = Vec::new();
-    for (i, c) in plan.iter().enumerate() {
-        if c.live && !ctx.live {
-            ctx.log(
-                "INFO",
-                &format!("[{}/{}] {} skipped - changes system state, needs --live", i + 1, plan.len(), c.name),
-            );
+    for (set, alone) in [(before.to_vec(), true), (overlapped, false), (after, true)] {
+        let (run, skip): (Vec<&Collector>, Vec<&Collector>) = set.into_iter().partition(|c| !c.live || ctx.live);
+        for c in skip {
+            ctx.log("INFO", &format!("{} skipped - changes system state, needs --live", c.name));
             results.push(json!({ "Collector": c.name, "Phase": c.phase, "Status": "Skipped (needs --live)", "DurationSec": 0, "Probes": c.probes.len(), "Errors": 0 }));
-            continue;
         }
-        ctx.log("INFO", &format!("[{}/{}] {} ({})", i + 1, plan.len(), c.name, c.phase));
-        let r = run_collector(ctx, c);
-        let level = if r["Status"] == "Success" { "OK" } else { "WARN" };
-        ctx.log(
-            level,
-            &format!("{}: {} in {}s", c.name, r["Status"].as_str().unwrap_or("?"), r["DurationSec"]),
-        );
-        results.push(r);
+        if alone {
+            run.iter().for_each(|c| results.extend(run_set(ctx, &[*c])));
+        } else {
+            results.extend(run_set(ctx, &run));
+        }
     }
 
     ctx.log("INFO", "Hashing evidence into the manifest");
@@ -395,6 +483,7 @@ mod tests {
             raw: true,
             timeout: Duration::from_secs(5),
             max_copy_mb: 1,
+            jobs: 4,
             started: util::now(),
         }
     }
@@ -433,6 +522,46 @@ mod tests {
         let m = ctx.out.join(MANIFEST);
         fs::write(&m, fs::read_to_string(&m).unwrap().replace("TEST-1", "TEST-2")).unwrap();
         assert!(!verify(&ctx.out).unwrap());
+        fs::remove_dir_all(ctx.out.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn par_map_keeps_input_order_and_overlaps() {
+        let items: Vec<u64> = (0..40).collect();
+        let t = std::time::Instant::now();
+        let out = par_map(&items, 8, |n| {
+            std::thread::sleep(Duration::from_millis(20));
+            n * 2
+        });
+        assert_eq!(out, items.iter().map(|n| n * 2).collect::<Vec<_>>());
+        assert!(t.elapsed() < Duration::from_millis(40 * 20 / 2), "work did not overlap");
+        assert_eq!(par_map(&items, 1, |n| *n), items);
+        assert!(par_map(&[] as &[u64], 4, |n| *n).is_empty());
+    }
+
+    #[test]
+    fn overlapped_run_writes_every_collector_with_probes_in_catalog_order() {
+        let ctx = test_ctx("par");
+        let set = plan(&["Network".into(), "Persistence".into(), "FileSystem".into()], &[]);
+        collect(&ctx, &set, false).unwrap();
+        for c in &set {
+            let ev: Value = serde_json::from_slice(&fs::read(ctx.out.join(format!("{}.json", c.name))).unwrap()).unwrap();
+            let seen =
+                ev["Data"].as_object().unwrap().len() + ev["Errors"].as_array().unwrap().len() + ev["Skipped"].as_array().unwrap().len();
+            assert_eq!(seen, c.probes.len(), "{} lost a probe", c.name);
+            let order: Vec<&str> = ev["Data"].as_object().unwrap().keys().map(String::as_str).collect();
+            let expect: Vec<&str> = c.probes.iter().map(|p| p.name()).filter(|n| order.contains(n)).collect();
+            assert_eq!(order, expect, "{} probes out of order", c.name);
+        }
+        let m: Value = serde_json::from_slice(&fs::read(ctx.out.join(MANIFEST)).unwrap()).unwrap();
+        let rows: Vec<&str> = m["CollectorResults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["Collector"].as_str().unwrap())
+            .collect();
+        assert_eq!(rows, set.iter().map(|c| c.name).collect::<Vec<_>>());
+        assert!(verify(&ctx.out).unwrap());
         fs::remove_dir_all(ctx.out.parent().unwrap()).unwrap();
     }
 

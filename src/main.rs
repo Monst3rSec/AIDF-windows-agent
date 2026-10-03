@@ -36,6 +36,7 @@ COLLECT OPTIONS
   --tools <dir>          Directory holding winpmem*.exe  [default <exe dir>\\Tools]
   --max-mb <n>           Per-file ceiling for raw copies and packaging  [default 1024]
   --timeout <sec>        Per-command timeout          [default 300]
+  --jobs <n>             Probes run at once; 1 = strictly sequential  [default: CPU cores, 4 to 8]
 
 Collection is read-only unless --live is given.";
 
@@ -78,6 +79,7 @@ fn collect(mut a: Args) -> Result<ExitCode, String> {
         None => Ok(default),
         Some(s) => s.parse::<u64>().map_err(|_| format!("{name} expects a number, got '{s}'")),
     };
+    let default_jobs = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(4, 8) as u64;
     let ctx = Ctx {
         case: a
             .value("--case")
@@ -97,6 +99,7 @@ fn collect(mut a: Args) -> Result<ExitCode, String> {
         raw: !a.flag("--no-raw"),
         timeout: Duration::from_secs(num(a.value("--timeout"), "--timeout", 300)?),
         max_copy_mb: num(a.value("--max-mb").or_else(|| env("DFIR_PACKAGE_MAXMB")), "--max-mb", 1024)?,
+        jobs: num(a.value("--jobs").or_else(|| env("AIDF_JOBS")), "--jobs", default_jobs)?.clamp(1, 32) as usize,
         started,
         host,
     };
