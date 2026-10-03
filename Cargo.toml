@@ -1,0 +1,21 @@
+[package]
+name = "aidf"
+version = "0.1.0"
+edition = "2021"
+description = "AIDF Windows Agent - single-binary Windows DFIR evidence collector and offline analyzer"
+license = "MIT"
+repository = "https://github.com/Monst3rSec/AIDF-windows-agent"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
